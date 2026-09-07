@@ -1,0 +1,204 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (留空则自动提取版本，例如 v0.38.1)'
+        required: false
+        type: string
+      prerelease:
+        description: '是否标记为 Pre-release'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - release
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build & Release (Universal)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Release Tag
+        id: vars
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          if [ -z "$TAG" ]; then
+            if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+              TAG="${{ github.ref_name }}"
+            elif [ -f releases/latest.json ]; then
+              TAG="v$(python3 -c 'import json; print(json.load(open("releases/latest.json"))["version"].lstrip("v"))')"
+            else
+              TAG="v$(git describe --tags --always)"
+            fi
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "TAG=${TAG}" >> $GITHUB_ENV
+          echo "Resolved tag: ${TAG}"
+
+      - name: Prepare CI developer config
+        run: |
+          cat > Configuration/Developer.xcconfig <<'EOF'
+          #include "LocalDev.xcconfig"
+
+          ROCKXY_TEAM_ID =
+          CODE_SIGN_IDENTITY =
+          DEVELOPMENT_TEAM =
+          EOF
+
+      - name: Select Xcode
+        run: |
+          for candidate in \
+            /Applications/Xcode_16.4.app \
+            /Applications/Xcode_16.3.app \
+            /Applications/Xcode_16.2.app \
+            /Applications/Xcode_16.1.app \
+            /Applications/Xcode_16.app \
+            /Applications/Xcode.app; do
+            if [ -d "$candidate" ]; then
+              sudo xcode-select -s "$candidate/Contents/Developer"
+              xcodebuild -version
+              exit 0
+            fi
+          done
+          echo "Supported Xcode app bundle not found on runner."
+          ls -1 /Applications | grep '^Xcode' || true
+          exit 1
+
+      - name: Build arm64
+        run: |
+          xcodebuild -project Rockxy.xcodeproj \
+            -scheme Rockxy \
+            -configuration Release \
+            -arch arm64 \
+            -derivedDataPath build/arm64 \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Build x86_64
+        run: |
+          xcodebuild -project Rockxy.xcodeproj \
+            -scheme Rockxy \
+            -configuration Release \
+            -arch x86_64 \
+            -derivedDataPath build/x86_64 \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Package Universal App, DMG and ZIP
+        run: |
+          helper_plist_name_from_app() {
+            /usr/libexec/PlistBuddy -c 'Print :RockxyHelperPlistName' "$1/Contents/Info.plist"
+          }
+
+          helper_plist_path_from_app() {
+            local app_path="$1"
+            local helper_plist_name
+            helper_plist_name="$(helper_plist_name_from_app "$app_path")"
+            printf '%s/Contents/Library/LaunchDaemons/%s\n' "$app_path" "$helper_plist_name"
+          }
+
+          helper_bundle_program_from_plist() {
+            /usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$1"
+          }
+
+          APP_NAME="Rockxy"
+          EXECUTABLE_NAME="Rockxy"
+          ARM_APP="build/arm64/Build/Products/Release/$APP_NAME.app"
+          X86_APP="build/x86_64/Build/Products/Release/$APP_NAME.app"
+          ARM_HELPER_PLIST="$(helper_plist_path_from_app "$ARM_APP")"
+          X86_HELPER_PLIST="$(helper_plist_path_from_app "$X86_APP")"
+          HELPER_BUNDLE_PROGRAM="$(helper_bundle_program_from_plist "$ARM_HELPER_PLIST")"
+          ARM_HELPER="$ARM_APP/$HELPER_BUNDLE_PROGRAM"
+          X86_HELPER="$X86_APP/$HELPER_BUNDLE_PROGRAM"
+          UNIVERSAL_APP="artifacts/$APP_NAME.app"
+
+          mkdir -p artifacts
+          cp -R "$ARM_APP" "$UNIVERSAL_APP"
+          UNIVERSAL_HELPER_PLIST="$(helper_plist_path_from_app "$UNIVERSAL_APP")"
+          UNIVERSAL_HELPER="$UNIVERSAL_APP/$HELPER_BUNDLE_PROGRAM"
+
+          # Combine main executable into universal binary
+          lipo -create \
+            "$ARM_APP/Contents/MacOS/$EXECUTABLE_NAME" \
+            "$X86_APP/Contents/MacOS/$EXECUTABLE_NAME" \
+            -output "$UNIVERSAL_APP/Contents/MacOS/$EXECUTABLE_NAME"
+
+          # Combine helper binary if present
+          if [ -f "$ARM_HELPER" ] && [ -f "$X86_HELPER" ]; then
+            lipo -create "$ARM_HELPER" "$X86_HELPER" -output "$UNIVERSAL_HELPER"
+          fi
+
+          # Ad-hoc sign the universal bundle
+          codesign --force --deep --sign - "$UNIVERSAL_APP"
+
+          # Verify universal binaries
+          lipo -info "$UNIVERSAL_APP/Contents/MacOS/$EXECUTABLE_NAME"
+          lipo -info "$UNIVERSAL_HELPER"
+
+          # Package ZIP
+          cd artifacts
+          zip -r "${APP_NAME}-${TAG}-universal.zip" "${APP_NAME}.app"
+
+          # Package DMG
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${APP_NAME}.app" -ov -format UDZO "${APP_NAME}-${TAG}.dmg"
+
+          # Generate checksums
+          shasum -a 256 "${APP_NAME}-${TAG}-universal.zip" > "${APP_NAME}-${TAG}-universal.zip.sha256"
+          shasum -a 256 "${APP_NAME}-${TAG}.dmg" > "${APP_NAME}-${TAG}.dmg.sha256"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            EXTRA_ARGS+=("--prerelease")
+          fi
+
+          FILES=(
+            artifacts/*.dmg
+            artifacts/*.dmg.sha256
+            artifacts/*-universal.zip
+            artifacts/*-universal.zip.sha256
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets..."
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            echo "Creating release $TAG..."
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "Rockxy $TAG" \
+              --generate-notes \
+              "${EXTRA_ARGS[@]}"
+          fi
